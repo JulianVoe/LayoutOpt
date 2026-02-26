@@ -306,6 +306,10 @@ struct Layout {
 
   // symbol frequency weights for proposal distribution
   std::vector<double> movable_w;
+
+  // Symbols and physical keys treated as Shift for modifier metrics.
+  std::unordered_set<u16> shift_codes;
+  std::unordered_set<u16> shift_keys;
 };
 
 static void build_slots(Layout& L, const HW& hw, int layers) {
@@ -362,10 +366,12 @@ struct Agg {
   double static_dist_sum = 0.0;
   u64 home_row_presses = 0, top_row_presses = 0, bot_row_presses = 0;
   std::array<std::array<u64,5>,2> finger_presses{}; // [hand][finger]
+  std::array<std::array<u64,5>,2> col_presses{};    // [hand][col], split by hand
   u64 left_presses = 0, right_presses = 0;
   u64 pinky_off_home = 0;
   double pinky_dist_sum = 0.0;
   double thumb_effort_sum = 0.0;
+  u64 col56_presses = 0;
 
   // press-bigram denom
   u64 big_n = 0;
@@ -373,10 +379,20 @@ struct Agg {
   // bigram accumulators
   double travel_sum = 0.0;
   u64 sfb = 0, sfb_rake = 0, sfb_slide = 0;
+  u64 sfb_2u = 0;
+  u64 skip_bigrams = 0;
+  u64 other_same_finger = 0;
   u64 lat_stretch = 0;
+  u64 lsb = 0;
   u64 scissors_full = 0, scissors_half = 0;
+  u64 pinky_scissors = 0, wide_scissors = 0;
   u64 alternation = 0;
   u64 roll_in = 0, roll_out = 0;
+  u64 shift_presses = 0;
+  u64 shift_bigram_n = 0, same_hand_shift = 0;
+  double shift_chord_cost_sum = 0.0;
+
+  u64 skip_bigrams2 = 0;
 
   // press-trigram denom
   u64 tri_n = 0;
@@ -467,6 +483,17 @@ static inline bool roll3_out(const HW& hw, u16 a, u16 b, u16 c) {
   return (fa > fb && fb > fc);
 }
 
+static inline bool is_pinky_scissor(const HW& hw, u16 a, u16 b) {
+  if (!(scissor_full(hw, a, b) || scissor_half(hw, a, b))) return false;
+  return hw.finger[a] == (int)FingerId::Pinky || hw.finger[b] == (int)FingerId::Pinky;
+}
+
+static inline bool is_wide_scissor(const HW& hw, u16 a, u16 b) {
+  if (!same_hand(hw, a, b)) return false;
+  if (!(scissor_full(hw, a, b) || scissor_half(hw, a, b))) return false;
+  return std::abs(hw.col[a] - hw.col[b]) >= 2;
+}
+
 static inline void add_press(Agg& A, const HW& hw, u16 k, u64 w) {
   A.press_n += w;
   A.effort_sum += (double)w * hw.effort[k];
@@ -479,8 +506,13 @@ static inline void add_press(Agg& A, const HW& hw, u16 k, u64 w) {
 
   if (h==(int)HandId::L || h==(int)HandId::R) {
     if (0<=f && f<5) A.finger_presses[h][f] += w;
+    if (0<=hw.col[k] && hw.col[k] < 5) A.col_presses[h][hw.col[k]] += w;
     const Vec2 home = hw.home_pos[h][std::clamp(f,0,4)];
     A.static_dist_sum += (double)w * hw.pos[k].dist(home);
+
+    if ((h==(int)HandId::L && hw.col[k]==4) || (h==(int)HandId::R && hw.col[k]==0)) {
+      A.col56_presses += w;
+    }
   }
 
   if (hw.row[k]==1) A.home_row_presses += w;
@@ -500,14 +532,20 @@ static inline void add_bigram(Agg& A, const HW& hw, u16 a, u16 b, u64 w) {
   A.travel_sum += (double)w * hw.pos[a].dist(hw.pos[b]);
 
   if (a!=b && same_finger(hw,a,b)) {
+    A.other_same_finger += w;
     A.sfb += w;
     if (rakeable_sfb(hw,a,b)) A.sfb_rake += w;
     if (slideable_sfb(hw,a,b)) A.sfb_slide += w;
+    if (std::abs(hw.row[a]-hw.row[b]) >= 2 || std::abs(hw.col[a]-hw.col[b]) >= 2) A.sfb_2u += w;
+    if (!rakeable_sfb(hw,a,b) && !slideable_sfb(hw,a,b)) A.skip_bigrams += w;
   }
   if (lateral_stretch(hw,a,b)) A.lat_stretch += w;
+  if (same_hand(hw,a,b) && !same_finger(hw,a,b) && std::abs(hw.col[a]-hw.col[b]) >= 3) A.lsb += w;
 
   if (scissor_full(hw,a,b)) A.scissors_full += w;
   if (scissor_half(hw,a,b)) A.scissors_half += w;
+  if (is_pinky_scissor(hw,a,b)) A.pinky_scissors += w;
+  if (is_wide_scissor(hw,a,b)) A.wide_scissors += w;
 
   if (diff_hand(hw,a,b)) A.alternation += w;
 
@@ -522,6 +560,7 @@ static inline void add_trigram(Agg& A, const HW& hw, u16 a, u16 b, u16 c, u64 w)
   if (weakish_redirect_trigram(hw,a,b,c)) A.weakish_redirects += w;
 
   if (a!=c && same_finger(hw,a,c)) A.skip_sfb += w;
+  if (a!=c && same_finger(hw,a,c) && !same_finger(hw,a,b) && !same_finger(hw,b,c)) A.skip_bigrams2 += w;
   if (tri_alternation(hw,a,b,c)) A.trigram_alt += w;
 
   if (roll3_in(hw,a,b,c))  A.roll3_in  += w;
@@ -538,11 +577,22 @@ static Agg accumulate(const HW& hw, const Corpus& C, const Layout& L) {
       prev1 = prev2 = std::numeric_limits<u16>::max();
       continue;
     }
+    const bool is_shift_code = L.shift_codes.contains(code);
+    if (is_shift_code) A.shift_presses += 1;
+
     const Seq& seq = L.code_seq.at(code);
     for (int i = 0; i < (int)seq.n; ++i) {
       const u16 key = seq.k[i];
       add_press(A, hw, key, 1);
-      if (prev1 != std::numeric_limits<u16>::max()) add_bigram(A, hw, prev1, key, 1);
+      if (prev1 != std::numeric_limits<u16>::max()) {
+        add_bigram(A, hw, prev1, key, 1);
+        const bool is_shift_pair = L.shift_keys.contains(prev1) || L.shift_keys.contains(key);
+        if (is_shift_pair) {
+          A.shift_bigram_n += 1;
+          if (same_hand(hw, prev1, key)) A.same_hand_shift += 1;
+          A.shift_chord_cost_sum += hw.pos[prev1].dist(hw.pos[key]) + hw.effort[prev1] + hw.effort[key];
+        }
+      }
       if (prev2 != std::numeric_limits<u16>::max()) add_trigram(A, hw, prev2, prev1, key, 1);
       prev2 = prev1;
       prev1 = key;
@@ -563,8 +613,36 @@ struct Metric {
   double (*val)(const Agg&);
 };
 
-// ---- stubs requested (present; implement later without changing optimizer plumbing)
-static double stub0(const Agg&){ return 0.0; }
+static double finger_usage_penalty(const Agg& A) {
+  if (!A.press_n) return 0.0;
+  constexpr std::array<double,5> target = {0.10, 0.16, 0.20, 0.34, 0.20};
+  std::array<double,5> actual{};
+  for (int h=0; h<2; ++h) {
+    for (int f=0; f<5; ++f) actual[f] += (double)A.finger_presses[h][f];
+  }
+  double penalty = 0.0;
+  for (int f=0; f<5; ++f) {
+    const double share = actual[f] / (double)A.press_n;
+    penalty += std::abs(share - target[f]);
+  }
+  return penalty;
+}
+
+static double column_usage_penalty(const Agg& A) {
+  if (!A.press_n) return 0.0;
+  constexpr std::array<double,5> target = {0.11, 0.17, 0.22, 0.25, 0.25};
+  double penalty = 0.0;
+  for (int h=0; h<2; ++h) {
+    u64 hand_total = 0;
+    for (int c=0; c<5; ++c) hand_total += A.col_presses[h][c];
+    if (!hand_total) continue;
+    for (int c=0; c<5; ++c) {
+      const double share = (double)A.col_presses[h][c] / (double)hand_total;
+      penalty += std::abs(share - target[c]);
+    }
+  }
+  return penalty;
+}
 
 // default metric list: ALL metrics discussed are present as entries
 static std::vector<Metric> default_metrics() {
@@ -573,9 +651,9 @@ static std::vector<Metric> default_metrics() {
     {"effort",            2.0, LowerBetter,  [](const Agg& A){ return (A.press_n? A.effort_sum / (double)A.press_n : 0.0); }},
     {"distance",          1.0, LowerBetter,  [](const Agg& A){ return (A.press_n? A.static_dist_sum / (double)A.press_n : 0.0); }},
     {"thumb_effort",      0.3, LowerBetter,  [](const Agg& A){ return (A.press_n? A.thumb_effort_sum / (double)A.press_n : 0.0); }},
-    {"finger_usage",      0.0, LowerBetter,  stub0},   // could be penalty vs targets
-    {"column_usage",      0.0, LowerBetter,  stub0},
-    {"col5&6",            0.0, LowerBetter,  stub0},
+    {"finger_usage",      0.0, LowerBetter,  finger_usage_penalty},
+    {"column_usage",      0.0, LowerBetter,  column_usage_penalty},
+    {"col5&6",            0.0, LowerBetter,  [](const Agg& A){ return (A.press_n? (double)A.col56_presses / (double)A.press_n : 0.0); }},
     {"row_home",          0.5, HigherBetter, [](const Agg& A){ return (A.press_n? (double)A.home_row_presses / (double)A.press_n : 0.0); }},
     {"row_top",           0.0, LowerBetter,  [](const Agg& A){ return (A.press_n? (double)A.top_row_presses / (double)A.press_n : 0.0); }},
     {"row_bottom",        0.0, LowerBetter,  [](const Agg& A){ return (A.press_n? (double)A.bot_row_presses / (double)A.press_n : 0.0); }},
@@ -589,25 +667,25 @@ static std::vector<Metric> default_metrics() {
     {"sfb_rakeable",      0.0, LowerBetter,  [](const Agg& A){ return (A.big_n? (double)A.sfb_rake / (double)A.big_n : 0.0); }},
     {"sfb_slideable",     0.0, LowerBetter,  [](const Agg& A){ return (A.big_n? (double)A.sfb_slide / (double)A.big_n : 0.0); }},
     {"sfb_effective",     2.0, LowerBetter,  [](const Agg& A){ if (!A.big_n) return 0.0; double eff = (double)A.sfb - (double)A.sfb_rake - (double)A.sfb_slide; return eff / (double)A.big_n; }},
-    {"sfb_2u",            0.0, LowerBetter,  stub0},   // analyzer-specific; implement if you define it
-    {"skip_bigrams",      0.0, LowerBetter,  stub0},   // general skip bigrams
-    {"skip_bigrams2",     0.0, LowerBetter,  stub0},   // requires 4-grams
-    {"other_same_finger", 0.0, LowerBetter,  stub0},
+    {"sfb_2u",            0.0, LowerBetter,  [](const Agg& A){ return (A.big_n? (double)A.sfb_2u / (double)A.big_n : 0.0); }},
+    {"skip_bigrams",      0.0, LowerBetter,  [](const Agg& A){ return (A.big_n? (double)A.skip_bigrams / (double)A.big_n : 0.0); }},
+    {"skip_bigrams2",     0.0, LowerBetter,  [](const Agg& A){ return (A.tri_n? (double)A.skip_bigrams2 / (double)A.tri_n : 0.0); }},
+    {"other_same_finger", 0.0, LowerBetter,  [](const Agg& A){ return (A.big_n? (double)A.other_same_finger / (double)A.big_n : 0.0); }},
 
     {"lat_stretch",       0.8, LowerBetter,  [](const Agg& A){ return (A.big_n? (double)A.lat_stretch / (double)A.big_n : 0.0); }},
-    {"lsb",               0.0, LowerBetter,  stub0},
+    {"lsb",               0.0, LowerBetter,  [](const Agg& A){ return (A.big_n? (double)A.lsb / (double)A.big_n : 0.0); }},
 
-    {"scissors",          0.0, LowerBetter,  stub0},
+    {"scissors",          0.0, LowerBetter,  [](const Agg& A){ return (A.big_n? (double)(A.scissors_full + A.scissors_half) / (double)A.big_n : 0.0); }},
     {"full_scissor",      0.8, LowerBetter,  [](const Agg& A){ return (A.big_n? (double)A.scissors_full / (double)A.big_n : 0.0); }},
     {"half_scissor",      0.5, LowerBetter,  [](const Agg& A){ return (A.big_n? (double)A.scissors_half / (double)A.big_n : 0.0); }},
-    {"pinky_scissors",    0.0, LowerBetter,  stub0},
-    {"wide_scissors",     0.0, LowerBetter,  stub0},
+    {"pinky_scissors",    0.0, LowerBetter,  [](const Agg& A){ return (A.big_n? (double)A.pinky_scissors / (double)A.big_n : 0.0); }},
+    {"wide_scissors",     0.0, LowerBetter,  [](const Agg& A){ return (A.big_n? (double)A.wide_scissors / (double)A.big_n : 0.0); }},
 
     {"alternation",       0.6, HigherBetter, [](const Agg& A){ return (A.big_n? (double)A.alternation / (double)A.big_n : 0.0); }},
     {"roll_in",           0.4, HigherBetter, [](const Agg& A){ return (A.big_n? (double)A.roll_in / (double)A.big_n : 0.0); }},
     {"roll_out",          0.4, LowerBetter,  [](const Agg& A){ return (A.big_n? (double)A.roll_out / (double)A.big_n : 0.0); }},
-    {"rolls:alts",        0.0, HigherBetter, stub0},
-    {"2-roll_in:out",     0.0, HigherBetter, stub0},
+    {"rolls:alts",        0.0, HigherBetter, [](const Agg& A){ double r = (double)(A.roll_in + A.roll_out); double al = (double)A.alternation; return r / (al + 1e-12); }},
+    {"2-roll_in:out",     0.0, HigherBetter, [](const Agg& A){ return (double)A.roll_in / ((double)A.roll_out + 1e-12); }},
 
     // Trigram flow
     {"skip_sfb",          0.6, LowerBetter,  [](const Agg& A){ return (A.tri_n? (double)A.skip_sfb / (double)A.tri_n : 0.0); }},
@@ -619,12 +697,12 @@ static std::vector<Metric> default_metrics() {
     {"3-roll_out",        0.0, LowerBetter,  [](const Agg& A){ return (A.tri_n? (double)A.roll3_out / (double)A.tri_n : 0.0); }},
 
     // Shift/modifier related (your log treats Shift as its own token; these are higher-level chord metrics)
-    {"shift_rate",        0.0, LowerBetter,  stub0},
-    {"same_hand_shift",   0.0, LowerBetter,  stub0},
-    {"shift_chord_cost",  0.0, LowerBetter,  stub0},
+    {"shift_rate",        0.0, LowerBetter,  [](const Agg& A){ return (A.press_n? (double)A.shift_presses / (double)A.press_n : 0.0); }},
+    {"same_hand_shift",   0.0, LowerBetter,  [](const Agg& A){ return (A.shift_bigram_n? (double)A.same_hand_shift / (double)A.shift_bigram_n : 0.0); }},
+    {"shift_chord_cost",  0.0, LowerBetter,  [](const Agg& A){ return (A.shift_bigram_n? A.shift_chord_cost_sum / (double)A.shift_bigram_n : 0.0); }},
 
     // Meta / reporting
-    {"bigram_total",      0.0, HigherBetter, stub0},
+    {"bigram_total",      0.0, HigherBetter, [](const Agg& A){ return (double)A.big_n; }},
   };
 }
 
@@ -652,6 +730,8 @@ static void build_initial_layout(
   L.code_slot.clear();
   L.code_seq.clear();
   L.movable.clear();
+  L.shift_codes.clear();
+  L.shift_keys.clear();
 
   // Decide fixed tokens (hardware reality-ish). Detected by Linux names if present.
   // You can extend this list freely.
@@ -694,6 +774,11 @@ static void build_initial_layout(
     Seq s{}; s.n = 1; s.k[0] = (u16)(*pk);
     L.code_slot[*code] = -1;
     L.code_seq[*code] = s;
+
+    if (nm == "KEY_LEFTSHIFT" || nm == "KEY_RIGHTSHIFT") {
+      L.shift_codes.insert(*code);
+      L.shift_keys.insert((u16)(*pk));
+    }
   }
 
   // Movable symbols: everything else that appears.
