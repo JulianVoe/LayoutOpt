@@ -196,6 +196,202 @@ struct HW {
   std::array<std::array<Vec2,5>,2> home_pos{};
 };
 
+static HW make_glove80_example() {
+  HW hw;
+
+  // We model the Glove80 as:
+  // - per hand: 6 columns (C1..C6) and 6 finger rows (R1..R6), but only 34 actual finger keys:
+  //     LH missing: C1R1 and C1R6
+  //     RH missing: C4R1 and C5R6
+  // - per hand: 6 thumb keys T1..T6 (2 rows of 3), total keys = 2*(34+6)=80
+  //
+  // Internal column indexing:
+  //   LH: col 0..5 corresponds to C6,C5,C4,C3,C2,C1  (outer -> inner)
+  //   RH: col 0..5 corresponds to C1,C2,C3,C4,C5,C6  (inner -> outer)
+  //
+  // Row category (for metrics): 0=top, 1=home, 2=bottom, 3=thumb
+  // Physical rows R1..R6 are embedded into y-coordinates, but mapped to row-category as:
+  //   R1,R2,R3 -> rowcat=0 ; R4 -> rowcat=1 ; R5,R6 -> rowcat=2.
+
+  auto add = [&](int rowcat, int col, float x, float y, int hand, int finger, float effort, bool perm) -> int {
+    hw.row.push_back(rowcat);
+    hw.col.push_back(col);
+    hw.pos.push_back({x,y});
+    hw.hand.push_back(hand);
+    hw.finger.push_back(finger);
+    hw.effort.push_back(effort);
+    if (perm) hw.perm_keys.push_back(hw.K);
+    return hw.K++;
+  };
+
+  auto eff = [&](int finger, int rowcat, bool thumb)->float{
+    float e = 1.0f;
+    if (thumb) e *= 0.60f;
+
+    if (finger == (int)FingerId::Index)  e *= 0.85f;
+    if (finger == (int)FingerId::Middle) e *= 0.80f;
+    if (finger == (int)FingerId::Ring)   e *= 1.05f;
+    if (finger == (int)FingerId::Pinky)  e *= 1.25f;
+    if (finger == (int)FingerId::Thumb)  e *= 0.65f;
+
+    // Row category penalties (coarse).
+    if (rowcat == 0) e *= 1.10f; // top-ish
+    if (rowcat == 2) e *= 1.12f; // bottom-ish
+    return e;
+  };
+
+  auto finger_for_col_LH = [&](int col)->int{
+    // LH columns: C6,C5,C4,C3,C2,C1
+    // pinky handles C6,C5; ring C4; middle C3; index C2,C1
+    if (col <= 1) return (int)FingerId::Pinky;
+    if (col == 2) return (int)FingerId::Ring;
+    if (col == 3) return (int)FingerId::Middle;
+    return (int)FingerId::Index; // col 4,5
+  };
+
+  auto finger_for_col_RH = [&](int col)->int{
+    // RH columns: C1,C2,C3,C4,C5,C6
+    // index handles C1,C2; middle C3; ring C4; pinky C5,C6
+    if (col <= 1) return (int)FingerId::Index;
+    if (col == 2) return (int)FingerId::Middle;
+    if (col == 3) return (int)FingerId::Ring;
+    return (int)FingerId::Pinky; // col 4,5
+  };
+
+  // 2D geometry (proxy): column spacing + mild per-column y-stagger to mimic concavity.
+  const float dx = 1.05f;
+  const float gap = 12.0f;
+
+  // Physical finger rows R1..R6 as y (top to bottom).
+  const float yR[6] = {0.00f, 0.85f, 1.70f, 2.55f, 3.40f, 4.25f};
+
+  // Column stagger (small). LH and RH differ only because LH col-order is reversed w.r.t. C labels.
+  const float stagL[6] = {+0.12f, +0.06f, +0.02f, -0.04f, -0.02f, +0.04f};
+  const float stagR[6] = {+0.04f, -0.02f, -0.04f, +0.02f, +0.06f, +0.12f};
+
+  // Key id lookup for later home_pos assignment:
+  int kid[2][6][6];
+  for (int h=0; h<2; ++h) for (int c=0; c<6; ++c) for (int r=0; r<6; ++r) kid[h][c][r] = -1;
+
+  // Presence masks from the MoErgo base-layer diagram:
+  // LH missing: (R1,C1) and (R6,C1) -> in our LH col indexing, C1 is col=5.
+  // RH missing: (R1,C4) and (R6,C5) -> in our RH col indexing, C4 is col=3, C5 is col=4.
+  auto lh_has = [&](int r /*0..5*/, int c /*0..5*/)->bool{
+    if ((r == 0 && c == 5) || (r == 5 && c == 5)) return false; // missing C1R1, C1R6
+    return true;
+  };
+  auto rh_has = [&](int r /*0..5*/, int c /*0..5*/)->bool{
+    if ((r == 0 && c == 3) || (r == 5 && c == 4)) return false; // missing C4R1, C5R6
+    return true;
+  };
+
+  auto rowcat_of_R = [&](int r /*0..5*/)->int{
+    // r=0..5 corresponds to R1..R6
+    if (r <= 2) return 0;  // R1..R3
+    if (r == 3) return 1;  // R4 (home)
+    return 2;              // R5..R6
+  };
+
+  // Finger well: LH
+  for (int r=0; r<6; ++r) {
+    int rc = rowcat_of_R(r);
+    for (int c=0; c<6; ++c) {
+      if (!lh_has(r,c)) continue;
+      int f = finger_for_col_LH(c);
+      float x = dx * (float)c;
+      float y = yR[r] + stagL[c];
+      int id = add(rc, c, x, y, (int)HandId::L, f, eff(f, rc, false), true);
+      kid[(int)HandId::L][c][r] = id;
+    }
+  }
+
+  // Finger well: RH
+  for (int r=0; r<6; ++r) {
+    int rc = rowcat_of_R(r);
+    for (int c=0; c<6; ++c) {
+      if (!rh_has(r,c)) continue;
+      int f = finger_for_col_RH(c);
+      float x = gap + dx * (float)c;
+      float y = yR[r] + stagR[c];
+      int id = add(rc, c, x, y, (int)HandId::R, f, eff(f, rc, false), true);
+      kid[(int)HandId::R][c][r] = id;
+    }
+  }
+
+  // Thumb cluster coordinates (proxy) arranged in two arcs, labeled T1..T6 as in the base-layer diagram.
+  // LH: T1 Shift, T2 Ctrl, T3 Lower, T4 Bksp, T5 Del, T6 Alt
+  // RH: T1 Shift, T2 Ctrl, T3 OS,    T4 Space, T5 Enter, T6 Alt
+  //
+  // We set rowcat=3 for all thumb keys; col is just a local 0..2 grouping index.
+
+  int thumb_id[2][6];
+  for (int h=0; h<2; ++h) for (int t=0; t<6; ++t) thumb_id[h][t] = -1;
+
+  // LH thumbs (placed between halves, near inner LH edge)
+  {
+    const float x0 = 6.6f, x1 = 7.5f, x2 = 8.4f;
+    const float yU = 5.35f, yL = 6.10f;
+    // T1..T3 (upper arc)
+    thumb_id[(int)HandId::L][0] = add(3, 0, x1, yU, (int)HandId::L, (int)FingerId::Thumb, eff((int)FingerId::Thumb,3,true), false); // T1
+    thumb_id[(int)HandId::L][1] = add(3, 1, x2, yU+0.15f, (int)HandId::L, (int)FingerId::Thumb, eff((int)FingerId::Thumb,3,true), false); // T2
+    thumb_id[(int)HandId::L][2] = add(3, 2, x2+0.55f, yU+0.35f, (int)HandId::L, (int)FingerId::Thumb, eff((int)FingerId::Thumb,3,true), false); // T3
+    // T4..T6 (lower arc)
+    thumb_id[(int)HandId::L][3] = add(3, 0, x0, yL, (int)HandId::L, (int)FingerId::Thumb, eff((int)FingerId::Thumb,3,true), false); // T4
+    thumb_id[(int)HandId::L][4] = add(3, 1, x1, yL+0.20f, (int)HandId::L, (int)FingerId::Thumb, eff((int)FingerId::Thumb,3,true), false); // T5
+    thumb_id[(int)HandId::L][5] = add(3, 2, x2, yL+0.40f, (int)HandId::L, (int)FingerId::Thumb, eff((int)FingerId::Thumb,3,true), false); // T6
+  }
+
+  // RH thumbs (placed between halves, near inner RH edge)
+  {
+    const float x0 = gap - 2.8f, x1 = gap - 1.9f, x2 = gap - 1.0f;
+    const float yU = 5.35f, yL = 6.10f;
+    // T1..T3 (upper arc) per diagram: T3 OS (leftmost), T2 Ctrl (middle), T1 Shift (rightmost).
+    // We keep the *naming* order T1..T3 in indices 0..2.
+    thumb_id[(int)HandId::R][0] = add(3, 2, x2, yU+0.35f, (int)HandId::R, (int)FingerId::Thumb, eff((int)FingerId::Thumb,3,true), false); // T1 (Shift)
+    thumb_id[(int)HandId::R][1] = add(3, 1, x1, yU+0.15f, (int)HandId::R, (int)FingerId::Thumb, eff((int)FingerId::Thumb,3,true), false); // T2 (Ctrl)
+    thumb_id[(int)HandId::R][2] = add(3, 0, x0, yU,        (int)HandId::R, (int)FingerId::Thumb, eff((int)FingerId::Thumb,3,true), false); // T3 (OS)
+    // T4..T6 (lower arc) per diagram: T6 Alt (leftmost), T5 Enter (middle), T4 Space (rightmost).
+    thumb_id[(int)HandId::R][3] = add(3, 2, x2+0.10f, yL+0.30f, (int)HandId::R, (int)FingerId::Thumb, eff((int)FingerId::Thumb,3,true), false); // T4 (Space)
+    thumb_id[(int)HandId::R][4] = add(3, 1, x1,        yL+0.10f, (int)HandId::R, (int)FingerId::Thumb, eff((int)FingerId::Thumb,3,true), false); // T5 (Enter)
+    thumb_id[(int)HandId::R][5] = add(3, 0, x0+0.10f,  yL-0.05f, (int)HandId::R, (int)FingerId::Thumb, eff((int)FingerId::Thumb,3,true), false); // T6 (Alt)
+  }
+
+  // Layer keys: default Glove80 base layout uses LH T3 ("Lower") as the layer key.
+  // We also provide RH T3 as an optional second layer key slot if you want multiple distinct layer triggers.
+  hw.layer_key = { thumb_id[(int)HandId::L][2], thumb_id[(int)HandId::R][2] };
+
+  // Home positions:
+  // Define the "rest" home keys on the home row (R4) as in the base-layer diagram.
+  // LH: A,S,D,F are on (C5,C4,C3,C2) of R4; RH: J,K,L,; on (C2,C3,C4,C5) of R4.
+  // Using our internal col index conventions:
+  //   LH: C5->col1, C4->col2, C3->col3, C2->col4
+  //   RH: C2->col1, C3->col2, C4->col3, C5->col4
+  for (int h=0; h<2; ++h) for (int f=0; f<5; ++f) hw.home_pos[h][f] = {};
+
+  const int R4 = 3; // 0-based r for R4
+
+  auto set_home = [&](int hand, int finger, int c, int r){
+    int id = kid[hand][c][r];
+    if (id >= 0) hw.home_pos[hand][finger] = hw.pos[id];
+  };
+
+  // LH homes
+  set_home((int)HandId::L, (int)FingerId::Pinky,  1, R4); // A at LH C5R4
+  set_home((int)HandId::L, (int)FingerId::Ring,   2, R4); // S at LH C4R4
+  set_home((int)HandId::L, (int)FingerId::Middle, 3, R4); // D at LH C3R4
+  set_home((int)HandId::L, (int)FingerId::Index,  4, R4); // F at LH C2R4
+  hw.home_pos[(int)HandId::L][(int)FingerId::Thumb] = hw.pos[thumb_id[(int)HandId::L][3]]; // T4 as thumb home
+
+  // RH homes
+  set_home((int)HandId::R, (int)FingerId::Index,  1, R4); // J at RH C2R4
+  set_home((int)HandId::R, (int)FingerId::Middle, 2, R4); // K at RH C3R4
+  set_home((int)HandId::R, (int)FingerId::Ring,   3, R4); // L at RH C4R4
+  set_home((int)HandId::R, (int)FingerId::Pinky,  4, R4); // ; at RH C5R4
+  hw.home_pos[(int)HandId::R][(int)FingerId::Thumb] = hw.pos[thumb_id[(int)HandId::R][3]]; // T4 as thumb home (Space)
+
+  return hw;
+}
+
 static HW make_voyager_like_example() {
   HW hw;
 
