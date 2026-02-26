@@ -25,6 +25,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <unordered_set>
@@ -501,12 +502,83 @@ struct Layout {
   std::vector<u16> movable;
 
   // symbol frequency weights for proposal distribution
-  std::vector<double> movable_w;
+  std::vector<double> movable_base_w;
+  std::vector<double> movable_adapt_w;
 
   // Symbols and physical keys treated as Shift for modifier metrics.
   std::unordered_set<u16> shift_codes;
   std::unordered_set<u16> shift_keys;
 };
+
+static bool is_alpha_key_name(std::string_view name) {
+  if (name.size() != 5) return false; // KEY_X
+  return name[0]=='K' && name[1]=='E' && name[2]=='Y' && name[3]=='_' &&
+         std::isalpha(static_cast<unsigned char>(name[4]));
+}
+
+static std::vector<int> thumb_keys_for_hand(const HW& hw, int hand) {
+  std::vector<int> keys;
+  for (int k=0; k<hw.K; ++k) {
+    if (hw.hand[k] == hand && hw.finger[k] == (int)FingerId::Thumb) keys.push_back(k);
+  }
+  const float mid_x = [&](){
+    if (hw.pos.empty()) return 0.0f;
+    float lo = hw.pos.front().x, hi = hw.pos.front().x;
+    for (const auto& p : hw.pos) {
+      lo = std::min(lo, p.x);
+      hi = std::max(hi, p.x);
+    }
+    return 0.5f * (lo + hi);
+  }();
+
+  std::sort(keys.begin(), keys.end(), [&](int a, int b){
+    const float da = std::abs(hw.pos[a].x - mid_x);
+    const float db = std::abs(hw.pos[b].x - mid_x);
+    if (std::abs(da - db) > 1e-6f) return da < db; // inner thumbs first
+    return hw.pos[a].y < hw.pos[b].y;
+  });
+  return keys;
+}
+
+static std::optional<int> fixed_key_for_name(const HW& hw, std::string_view nm) {
+  const auto left_thumbs  = thumb_keys_for_hand(hw, (int)HandId::L);
+  const auto right_thumbs = thumb_keys_for_hand(hw, (int)HandId::R);
+
+  auto pick = [](const std::vector<int>& v, std::size_t rank)->std::optional<int>{
+    if (v.empty()) return std::nullopt;
+    return v[std::min(rank, v.size()-1)];
+  };
+
+  if (nm=="KEY_SPACE")      return pick(right_thumbs, 0);
+  if (nm=="KEY_ENTER")      return pick(right_thumbs, 1);
+  if (nm=="KEY_BACKSPACE")  return pick(left_thumbs, 0);
+  if (nm=="KEY_TAB")        return pick(left_thumbs, 1);
+  if (nm=="KEY_ESC")        return pick(left_thumbs, 2);
+  if (nm=="KEY_LEFTSHIFT")  return pick(left_thumbs, 3);
+  if (nm=="KEY_RIGHTSHIFT") return pick(right_thumbs, 3);
+  if (nm=="KEY_LEFTCTRL")   return pick(left_thumbs, 4);
+  if (nm=="KEY_RIGHTCTRL")  return pick(right_thumbs, 4);
+  if (nm=="KEY_LEFTALT")    return pick(left_thumbs, 5);
+  if (nm=="KEY_RIGHTALT")   return pick(right_thumbs, 5);
+  return std::nullopt;
+}
+
+static double slot_move_bias(const HW& hw, int key) {
+  // Bias move proposals away from extreme outer columns.
+  // Works for arbitrary hardware as long as `col` has hand-local structure.
+  int min_col = std::numeric_limits<int>::max();
+  int max_col = std::numeric_limits<int>::min();
+  for (int k=0; k<hw.K; ++k) {
+    if (hw.hand[k] != hw.hand[key]) continue;
+    min_col = std::min(min_col, hw.col[k]);
+    max_col = std::max(max_col, hw.col[k]);
+  }
+  if (min_col >= max_col) return 1.0;
+  const double center = 0.5 * (min_col + max_col);
+  const double halfspan = 0.5 * (max_col - min_col);
+  const double outerness = std::abs(hw.col[key] - center) / std::max(1e-9, halfspan);
+  return 1.25 - 0.45 * outerness; // center ~1.25x, outer ~0.8x
+}
 
 static void build_slots(Layout& L, const HW& hw, int layers) {
   L.layers = layers;
@@ -937,34 +1009,12 @@ static void build_initial_layout(
     "KEY_SPACE","KEY_ENTER","KEY_BACKSPACE","KEY_TAB","KEY_ESC"
   };
 
-  // Choose physical keys for these fixed tokens (example only; adapt to your actual voyager map).
-  // We'll pin them to thumbs here.
-  const int left_thumb0  = 30;
-  const int left_thumb1  = 31;
-  const int left_thumb2  = 32;
-  const int right_thumb0 = 33;
-  const int right_thumb1 = 34;
-  const int right_thumb2 = 35;
-
-  auto fixed_physical = [&](std::string_view nm)->std::optional<int>{
-    if (nm=="KEY_SPACE")      return left_thumb1;
-    if (nm=="KEY_ENTER")      return right_thumb1;
-    if (nm=="KEY_BACKSPACE")  return right_thumb2;
-    if (nm=="KEY_TAB")        return left_thumb2;
-    if (nm=="KEY_ESC")        return left_thumb0;
-    if (nm=="KEY_LEFTSHIFT")  return left_thumb0;  // example: share with esc is bad; change on real setup
-    if (nm=="KEY_RIGHTSHIFT") return right_thumb0;
-    if (nm=="KEY_LEFTCTRL")   return left_thumb2;
-    if (nm=="KEY_RIGHTCTRL")  return right_thumb2;
-    return std::nullopt;
-  };
-
   // Mark fixed by name if present in header map.
   for (auto nm : fixed_names) {
     const auto code = code_named(C, nm);
     if (!code) continue;
 
-    auto pk = fixed_physical(nm);
+    auto pk = fixed_key_for_name(hw, nm);
     if (!pk) continue;
 
     Seq s{}; s.n = 1; s.k[0] = (u16)(*pk);
@@ -1023,10 +1073,15 @@ static void build_initial_layout(
   }
 
   // Proposal weights for frequency-biased swaps
-  L.movable_w.resize(L.movable.size());
+  L.movable_base_w.resize(L.movable.size());
+  L.movable_adapt_w.assign(L.movable.size(), 1.0);
   for (std::size_t i=0;i<L.movable.size();++i) {
     u16 code = L.movable[i];
-    L.movable_w[i] = (double)C.uni.at(code) + 1.0;
+    const std::string nm = C.code_to_name.contains(code) ? C.code_to_name.at(code) : "";
+    const double alpha_boost = is_alpha_key_name(nm) ? 1.75 : 1.0;
+    const int slot = L.code_slot.at(code);
+    const int key = L.slot_key[slot];
+    L.movable_base_w[i] = ((double)C.uni.at(code) + 1.0) * alpha_boost * slot_move_bias(hw, key);
   }
 }
 
@@ -1083,7 +1138,6 @@ struct Best {
 static Best anneal(const HW& hw, const Corpus& C, const std::vector<Metric>& M, Layout L0, const AnnealCfg& cfg) {
   std::mt19937_64 rng(cfg.seed);
 
-  std::discrete_distribution<std::size_t> pick_sym(L0.movable_w.begin(), L0.movable_w.end());
   std::uniform_real_distribution<double> U(0.0, 1.0);
   std::uniform_int_distribution<int> pick_slot(0, L0.slots-1);
 
@@ -1101,6 +1155,23 @@ static Best anneal(const HW& hw, const Corpus& C, const std::vector<Metric>& M, 
   best.agg = cur_agg;
 
   Layout L = std::move(L0);
+  std::vector<double> proposal_w(L.movable.size(), 1.0);
+
+  auto symbol_idx = [&](u16 code)->std::size_t {
+    auto it = std::find(L.movable.begin(), L.movable.end(), code);
+    return (std::size_t)std::distance(L.movable.begin(), it);
+  };
+
+  auto recompute_proposal = [&]() {
+    for (std::size_t i=0; i<L.movable.size(); ++i) {
+      u16 code = L.movable[i];
+      const int slot = L.code_slot.at(code);
+      const int key = L.slot_key[slot];
+      proposal_w[i] = std::max(1e-6, L.movable_base_w[i] * L.movable_adapt_w[i] * slot_move_bias(hw, key));
+    }
+  };
+
+  recompute_proposal();
 
   for (u64 it=0; it<cfg.iters; ++it) {
     double T = cosine_temp(it, cfg.iters, cfg.cycles, cfg.t_max, cfg.t_min);
@@ -1109,6 +1180,7 @@ static Best anneal(const HW& hw, const Corpus& C, const std::vector<Metric>& M, 
     // Occasionally, attempt moving a high-frequency symbol into a random empty slot.
     bool try_empty = (U(rng) < 0.10);
 
+    std::discrete_distribution<std::size_t> pick_sym(proposal_w.begin(), proposal_w.end());
     u16 symA = L.movable[pick_sym(rng)];
     u16 symB = symA;
 
@@ -1129,6 +1201,20 @@ static Best anneal(const HW& hw, const Corpus& C, const std::vector<Metric>& M, 
 
     auto [cand_score, cand_agg] = eval(cand);
     double delta = cand_score - cur_score;
+    const std::size_t ia = symbol_idx(symA);
+    const std::size_t ib = symbol_idx(symB);
+
+    auto boost_adaptive = [&](std::size_t idx, double factor) {
+      L.movable_adapt_w[idx] = std::clamp(L.movable_adapt_w[idx] * factor, 0.35, 6.0);
+    };
+
+    if (delta > 0) {
+      boost_adaptive(ia, 1.04);
+      if (symB != symA) boost_adaptive(ib, 1.03);
+    } else {
+      boost_adaptive(ia, 0.999);
+      if (symB != symA) boost_adaptive(ib, 0.999);
+    }
 
     bool accept = false;
     if (delta >= 0) accept = true;
@@ -1145,6 +1231,8 @@ static Best anneal(const HW& hw, const Corpus& C, const std::vector<Metric>& M, 
         best.agg = cur_agg;
       }
     }
+
+    recompute_proposal();
   }
 
   return best;
