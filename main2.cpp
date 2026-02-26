@@ -27,12 +27,16 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <unordered_set>
+#include <optional>
+#include <cstring>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
 #include <limits>
 #include <random>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -44,8 +48,7 @@ using u16 = std::uint16_t;
 using u32 = std::uint32_t;
 using u64 = std::uint64_t;
 
-static constexpr u16 PAUSE_CODE = 0;            // recorded
-static constexpr u16 PAUSE_ID   = 0xFFFFu;      // internal stream sentinel
+static constexpr u16 PAUSE_CODE = 0; // recorded + internal stream sentinel
 
 // ---------------- EVTLOG reader (your format) ----------------
 
@@ -59,25 +62,20 @@ struct Header {
 };
 #pragma pack(pop)
 
-static void die(const std::string& msg) {
-  std::cerr << "error: " << msg << "\n";
-  std::exit(1);
-}
-
 static std::unordered_map<u16,std::string> read_evtlog(
     const std::string& path,
     std::vector<u16>& out_codes_including_pauses)
 {
   std::ifstream in(path, std::ios::binary);
-  if (!in) die("cannot open " + path);
+  if (!in) throw std::runtime_error("cannot open " + path);
 
   Header h{};
   in.read(reinterpret_cast<char*>(&h), sizeof(h));
-  if (!in) die("file too short (no header)");
+  if (!in) throw std::runtime_error("file too short (no header)");
 
-  if (std::memcmp(h.magic, MAGIC, 8) != 0) die("bad magic (not EVTLOG1)");
-  if (h.version != 1) die("unsupported version");
-  if (h.record_size != sizeof(u16)) die("record_size mismatch (expected 2)");
+  if (std::memcmp(h.magic, MAGIC, 8) != 0) throw std::runtime_error("bad magic (not EVTLOG1)");
+  if (h.version != 1) throw std::runtime_error("unsupported version");
+  if (h.record_size != sizeof(u16)) throw std::runtime_error("record_size mismatch (expected 2)");
 
   std::unordered_map<u16,std::string> code_to_name;
   code_to_name.reserve(h.map_entries * 2);
@@ -86,10 +84,10 @@ static std::unordered_map<u16,std::string> read_evtlog(
     u16 code = 0; u8 n = 0;
     in.read(reinterpret_cast<char*>(&code), 2);
     in.read(reinterpret_cast<char*>(&n), 1);
-    if (!in) die("truncated mapping table");
+    if (!in) throw std::runtime_error("truncated mapping table");
     std::string name(n, '\0');
     in.read(name.data(), n);
-    if (!in) die("truncated mapping table (name)");
+    if (!in) throw std::runtime_error("truncated mapping table (name)");
     code_to_name.emplace(code, std::move(name));
   }
 
@@ -102,7 +100,7 @@ static std::unordered_map<u16,std::string> read_evtlog(
     if (!in) break;
     out_codes_including_pauses.push_back(kc);
   }
-  if (out_codes_including_pauses.empty()) die("no records");
+  if (out_codes_including_pauses.empty()) throw std::runtime_error("no records");
 
   return code_to_name;
 }
@@ -110,14 +108,12 @@ static std::unordered_map<u16,std::string> read_evtlog(
 // ---------------- Corpus: compressed symbols + ngrams w/ pause boundaries ----------------
 
 struct Corpus {
-  // symbol IDs are 0..S-1
-  std::vector<u16> id_to_code;     // size S
-  std::vector<int> code_to_id;     // size max_code+1, -1 if unused
-  std::vector<std::string> id_to_name;
+  std::unordered_map<u16,std::string> code_to_name;
+  std::unordered_map<std::string,u16> name_to_code;
+  std::unordered_set<u16> occurring_codes;
+  std::vector<u16> stream;         // keycodes with PAUSE_CODE boundaries
 
-  std::vector<u16> stream;         // symbol IDs with PAUSE_ID boundaries
-
-  std::vector<u64> uni;            // size S
+  std::unordered_map<u16,u64> uni;
   std::unordered_map<u32,u64> bi;  // key = (a<<16)|b
   std::unordered_map<u64,u64> tri; // key = (a<<32)|(b<<16)|c
 
@@ -131,64 +127,34 @@ static Corpus build_corpus(
     const std::vector<u16>& codes_with_pauses,
     const std::unordered_map<u16,std::string>& code_to_name)
 {
-  u16 max_code = 0;
-  std::vector<u16> uniq;
-  uniq.reserve(512);
-
-  {
-    std::unordered_map<u16,u8> seen;
-    seen.reserve(1024);
-    for (u16 kc : codes_with_pauses) {
-      if (kc == PAUSE_CODE) continue;
-      max_code = std::max(max_code, kc);
-      if (!seen.emplace(kc,1).second) continue;
-      uniq.push_back(kc);
-    }
-  }
-  std::sort(uniq.begin(), uniq.end());
-
   Corpus C;
-  C.id_to_code = uniq;
-  const int S = (int)uniq.size();
-
-  C.code_to_id.assign((int)max_code + 1, -1);
-  C.id_to_name.resize(S);
-
-  for (int i=0; i<S; ++i) {
-    C.code_to_id[uniq[i]] = i;
-    auto it = code_to_name.find(uniq[i]);
-    C.id_to_name[i] = (it==code_to_name.end() ? ("KEYCODE_" + std::to_string(uniq[i])) : it->second);
-  }
+  C.code_to_name = code_to_name;
+  C.name_to_code.reserve(code_to_name.size());
+  for (const auto& [code, name] : code_to_name) C.name_to_code.emplace(name, code);
 
   C.stream.reserve(codes_with_pauses.size());
   for (u16 kc : codes_with_pauses) {
-    if (kc == PAUSE_CODE) {
-      C.stream.push_back(PAUSE_ID);
-    } else {
-      int id = (kc <= max_code ? C.code_to_id[kc] : -1);
-      if (id < 0) die("internal: missing id for code");
-      C.stream.push_back((u16)id);
-    }
+    C.stream.push_back(kc);
+    if (kc != PAUSE_CODE) C.occurring_codes.insert(kc);
   }
 
-  C.uni.assign(S, 0);
   C.bi.reserve(std::min<u64>(C.stream.size(), 1<<20));
   C.tri.reserve(std::min<u64>(C.stream.size(), 1<<20));
 
-  u16 prev1 = PAUSE_ID;
-  u16 prev2 = PAUSE_ID;
+  u16 prev1 = PAUSE_CODE;
+  u16 prev2 = PAUSE_CODE;
 
   for (u16 x : C.stream) {
-    if (x == PAUSE_ID) {
-      prev1 = prev2 = PAUSE_ID;
+    if (x == PAUSE_CODE) {
+      prev1 = prev2 = PAUSE_CODE;
       continue;
     }
     C.uni[x]++; C.n1++;
 
-    if (prev1 != PAUSE_ID) {
+    if (prev1 != PAUSE_CODE) {
       C.bi[pack2(prev1, x)]++; C.n2++;
     }
-    if (prev2 != PAUSE_ID && prev1 != PAUSE_ID) {
+    if (prev2 != PAUSE_CODE && prev1 != PAUSE_CODE) {
       C.tri[pack3(prev2, prev1, x)]++; C.n3++;
     }
     prev2 = prev1;
@@ -202,18 +168,23 @@ static Corpus build_corpus(
 //
 // Finger encoding chosen so "outer->inner roll direction" is numeric order.
 // 0=pinky,1=ring,2=middle,3=index,4=thumb. (Thumb excluded from roll logic by default.)
-static constexpr int F_PINKY  = 0;
-static constexpr int F_RING   = 1;
-static constexpr int F_MIDDLE = 2;
-static constexpr int F_INDEX  = 3;
-static constexpr int F_THUMB  = 4;
+enum class FingerId : int { Pinky=0, Ring=1, Middle=2, Index=3, Thumb=4 };
+enum class HandId : int { L=0, R=1 };
 
-static constexpr int H_L = 0;
-static constexpr int H_R = 1;
+struct Vec2 {
+  float x = 0.0f;
+  float y = 0.0f;
+
+  float dist(const Vec2& o) const {
+    const float dx = x - o.x;
+    const float dy = y - o.y;
+    return std::sqrt(dx*dx + dy*dy);
+  }
+};
 
 struct HW {
   int K = 0;
-  std::vector<float> x, y;         // coords
+  std::vector<Vec2> pos;          // coords
   std::vector<int> hand, finger;   // 0/1, 0..4
   std::vector<int> row, col;       // user-defined
   std::vector<float> effort;       // per press
@@ -222,8 +193,7 @@ struct HW {
   std::vector<int> layer_key;      // layer_key[l] gives physical key id used to access layer l (l>=1). size = L-1.
 
   // home position for each hand/finger (used for static distance)
-  std::array<std::array<float,5>,2> home_x{};
-  std::array<std::array<float,5>,2> home_y{};
+  std::array<std::array<Vec2,5>,2> home_pos{};
 };
 
 static HW make_voyager_like_example() {
@@ -232,8 +202,7 @@ static HW make_voyager_like_example() {
   auto add = [&](int row, int col, float x, float y, int hand, int finger, float effort, bool perm){
     hw.row.push_back(row);
     hw.col.push_back(col);
-    hw.x.push_back(x);
-    hw.y.push_back(y);
+    hw.pos.push_back({x,y});
     hw.hand.push_back(hand);
     hw.finger.push_back(finger);
     hw.effort.push_back(effort);
@@ -244,20 +213,20 @@ static HW make_voyager_like_example() {
   auto eff = [&](int finger, int row, bool thumb)->float{
     float e = 1.0f;
     if (thumb) e *= 0.6f;
-    if (finger == F_INDEX)  e *= 0.85f;
-    if (finger == F_MIDDLE) e *= 0.80f;
-    if (finger == F_RING)   e *= 1.05f;
-    if (finger == F_PINKY)  e *= 1.25f;
+    if (finger == (int)FingerId::Index)  e *= 0.85f;
+    if (finger == (int)FingerId::Middle) e *= 0.80f;
+    if (finger == (int)FingerId::Ring)   e *= 1.05f;
+    if (finger == (int)FingerId::Pinky)  e *= 1.25f;
     if (row == 0) e *= 1.08f;
     if (row == 2) e *= 1.12f;
     return e;
   };
 
   auto finger_for_col = [&](int c)->int{
-    if (c==0) return F_PINKY;
-    if (c==1) return F_RING;
-    if (c==2) return F_MIDDLE;
-    return F_INDEX; // cols 3,4
+    if (c==0) return (int)FingerId::Pinky;
+    if (c==1) return (int)FingerId::Ring;
+    if (c==2) return (int)FingerId::Middle;
+    return (int)FingerId::Index; // cols 3,4
   };
 
   const float gap = 7.0f;
@@ -265,17 +234,17 @@ static HW make_voyager_like_example() {
   // 3x5 per hand, permutable
   for (int r=0;r<3;++r) for (int c=0;c<5;++c) {
     int f = finger_for_col(c);
-    add(r,c, (float)c,(float)r, H_L, f, eff(f,r,false), true);
+    add(r,c, (float)c,(float)r, (int)HandId::L, f, eff(f,r,false), true);
   }
   for (int r=0;r<3;++r) for (int c=0;c<5;++c) {
     int f = finger_for_col(c);
-    add(r,c, gap+(float)c,(float)r, H_R, f, eff(f,r,false), true);
+    add(r,c, gap+(float)c,(float)r, (int)HandId::R, f, eff(f,r,false), true);
   }
 
   // 3 thumbs per hand, not permutable
   for (int t=0;t<3;++t) {
-    add(3,t, 1.5f+(float)t, 3.2f, H_L, F_THUMB, eff(F_THUMB,3,true), false);
-    add(3,t, gap+1.5f+(float)t, 3.2f, H_R, F_THUMB, eff(F_THUMB,3,true), false);
+    add(3,t, 1.5f+(float)t, 3.2f, (int)HandId::L, (int)FingerId::Thumb, eff((int)FingerId::Thumb,3,true), false);
+    add(3,t, gap+1.5f+(float)t, 3.2f, (int)HandId::R, (int)FingerId::Thumb, eff((int)FingerId::Thumb,3,true), false);
   }
 
   // Pick layer keys: you can support multiple layers if you have distinct layer keys.
@@ -287,24 +256,23 @@ static HW make_voyager_like_example() {
 
   // Home positions: choose home-row key for each hand/finger by scanning row==1 and matching finger.
   for (int h=0; h<2; ++h) for (int f=0; f<5; ++f) {
-    hw.home_x[h][f] = 0.0f;
-    hw.home_y[h][f] = 0.0f;
+    hw.home_pos[h][f] = {};
   }
   for (int h=0; h<2; ++h) {
     for (int f=0; f<4; ++f) { // exclude thumb
       bool found = false;
       for (int k=0; k<hw.K; ++k) {
         if (hw.hand[k]==h && hw.finger[k]==f && hw.row[k]==1) {
-          hw.home_x[h][f]=hw.x[k]; hw.home_y[h][f]=hw.y[k];
+          hw.home_pos[h][f]=hw.pos[k];
           found = true;
           break;
         }
       }
-      if (!found) { hw.home_x[h][f]=0; hw.home_y[h][f]=0; }
+      if (!found) { hw.home_pos[h][f]={}; }
     }
     // thumb home: pick first thumb
-    for (int k=0;k<hw.K;++k) if (hw.hand[k]==h && hw.finger[k]==F_THUMB) {
-      hw.home_x[h][F_THUMB]=hw.x[k]; hw.home_y[h][F_THUMB]=hw.y[k];
+    for (int k=0;k<hw.K;++k) if (hw.hand[k]==h && hw.finger[k]==(int)FingerId::Thumb) {
+      hw.home_pos[h][(int)FingerId::Thumb]=hw.pos[k];
       break;
     }
   }
@@ -327,24 +295,18 @@ struct Layout {
   std::vector<int> slot_layer;       // size slots -> layer
   std::vector<float> slot_cost;      // size slots (for greedy init)
 
-  // For each symbol id:
-  std::vector<int> sym_slot;         // size S, -1 if fixed
-  std::vector<Seq> sym_seq;          // size S, always defined (fixed or slot-derived)
+  std::unordered_map<u16, int> code_slot; // -1 fixed, otherwise slot
+  std::unordered_map<u16, Seq> code_seq;
 
-  // Inverse: slot -> symbol id, -1 if empty
-  std::vector<int> slot_sym;         // size slots
+  // Inverse: slot -> keycode, PAUSE_CODE if empty
+  std::vector<u16> slot_code;
 
   // movable symbol list (those not fixed)
-  std::vector<int> movable;
+  std::vector<u16> movable;
 
   // symbol frequency weights for proposal distribution
   std::vector<double> movable_w;
 };
-
-static inline float dist2(float ax,float ay,float bx,float by){
-  float dx=ax-bx, dy=ay-by;
-  return std::sqrt(dx*dx+dy*dy);
-}
 
 static void build_slots(Layout& L, const HW& hw, int layers) {
   L.layers = layers;
@@ -433,7 +395,7 @@ static inline bool same_finger(const HW& hw, u16 a, u16 b) { return hw.finger[a]
 
 static inline bool adjacent_nonthumb_fingers(const HW& hw, u16 a, u16 b) {
   int fa=hw.finger[a], fb=hw.finger[b];
-  if (fa==F_THUMB || fb==F_THUMB) return false;
+  if (fa==(int)FingerId::Thumb || fb==(int)FingerId::Thumb) return false;
   return std::abs(fa-fb)==1;
 }
 
@@ -462,30 +424,30 @@ static inline bool slideable_sfb(const HW& hw, u16 a, u16 b) {
 static inline bool roll_in(const HW& hw, u16 a, u16 b) {
   if (!same_hand(hw,a,b)) return false;
   int fa=hw.finger[a], fb=hw.finger[b];
-  if (fa==F_THUMB || fb==F_THUMB || fa==fb) return false;
+  if (fa==(int)FingerId::Thumb || fb==(int)FingerId::Thumb || fa==fb) return false;
   return fb > fa; // outer->inner
 }
 static inline bool roll_out(const HW& hw, u16 a, u16 b) {
   if (!same_hand(hw,a,b)) return false;
   int fa=hw.finger[a], fb=hw.finger[b];
-  if (fa==F_THUMB || fb==F_THUMB || fa==fb) return false;
+  if (fa==(int)FingerId::Thumb || fb==(int)FingerId::Thumb || fa==fb) return false;
   return fb < fa;
 }
 static inline bool redirect_trigram(const HW& hw, u16 a, u16 b, u16 c) {
   if (!(same_hand(hw,a,b) && same_hand(hw,b,c))) return false;
   int fa=hw.finger[a], fb=hw.finger[b], fc=hw.finger[c];
-  if (fa==F_THUMB || fb==F_THUMB || fc==F_THUMB) return false;
+  if (fa==(int)FingerId::Thumb || fb==(int)FingerId::Thumb || fc==(int)FingerId::Thumb) return false;
   return (fa < fb && fb > fc) || (fa > fb && fb < fc);
 }
 static inline bool weak_redirect_trigram(const HW& hw, u16 a, u16 b, u16 c) {
   if (!redirect_trigram(hw,a,b,c)) return false;
   int fb=hw.finger[b];
-  return fb==F_RING || fb==F_PINKY;
+  return fb==(int)FingerId::Ring || fb==(int)FingerId::Pinky;
 }
 static inline bool weakish_redirect_trigram(const HW& hw, u16 a, u16 b, u16 c) {
   if (!redirect_trigram(hw,a,b,c)) return false;
   int fb=hw.finger[b];
-  return fb==F_MIDDLE || fb==F_RING || fb==F_PINKY;
+  return fb==(int)FingerId::Middle || fb==(int)FingerId::Ring || fb==(int)FingerId::Pinky;
 }
 static inline bool tri_alternation(const HW& hw, u16 a, u16 b, u16 c) {
   int ha=hw.hand[a], hb=hw.hand[b], hc=hw.hand[c];
@@ -495,13 +457,13 @@ static inline bool tri_alternation(const HW& hw, u16 a, u16 b, u16 c) {
 static inline bool roll3_in(const HW& hw, u16 a, u16 b, u16 c) {
   if (!(same_hand(hw,a,b) && same_hand(hw,b,c))) return false;
   int fa=hw.finger[a], fb=hw.finger[b], fc=hw.finger[c];
-  if (fa==F_THUMB || fb==F_THUMB || fc==F_THUMB) return false;
+  if (fa==(int)FingerId::Thumb || fb==(int)FingerId::Thumb || fc==(int)FingerId::Thumb) return false;
   return (fa < fb && fb < fc);
 }
 static inline bool roll3_out(const HW& hw, u16 a, u16 b, u16 c) {
   if (!(same_hand(hw,a,b) && same_hand(hw,b,c))) return false;
   int fa=hw.finger[a], fb=hw.finger[b], fc=hw.finger[c];
-  if (fa==F_THUMB || fb==F_THUMB || fc==F_THUMB) return false;
+  if (fa==(int)FingerId::Thumb || fb==(int)FingerId::Thumb || fc==(int)FingerId::Thumb) return false;
   return (fa > fb && fb > fc);
 }
 
@@ -512,31 +474,30 @@ static inline void add_press(Agg& A, const HW& hw, u16 k, u64 w) {
   const int h = hw.hand[k];
   const int f = hw.finger[k];
 
-  if (h==H_L) A.left_presses += w;
-  if (h==H_R) A.right_presses += w;
+  if (h==(int)HandId::L) A.left_presses += w;
+  if (h==(int)HandId::R) A.right_presses += w;
 
-  if (h==H_L || h==H_R) {
+  if (h==(int)HandId::L || h==(int)HandId::R) {
     if (0<=f && f<5) A.finger_presses[h][f] += w;
-    const float hx = hw.home_x[h][std::clamp(f,0,4)];
-    const float hy = hw.home_y[h][std::clamp(f,0,4)];
-    A.static_dist_sum += (double)w * dist2(hw.x[k],hw.y[k],hx,hy);
+    const Vec2 home = hw.home_pos[h][std::clamp(f,0,4)];
+    A.static_dist_sum += (double)w * hw.pos[k].dist(home);
   }
 
   if (hw.row[k]==1) A.home_row_presses += w;
   if (hw.row[k]==0) A.top_row_presses += w;
   if (hw.row[k]==2) A.bot_row_presses += w;
 
-  if (f==F_PINKY) {
+  if (f==(int)FingerId::Pinky) {
     if (hw.row[k]!=1) A.pinky_off_home += w;
-    const float hx = hw.home_x[h][F_PINKY], hy = hw.home_y[h][F_PINKY];
-    A.pinky_dist_sum += (double)w * dist2(hw.x[k],hw.y[k],hx,hy);
+    const Vec2 home = hw.home_pos[h][(int)FingerId::Pinky];
+    A.pinky_dist_sum += (double)w * hw.pos[k].dist(home);
   }
-  if (f==F_THUMB) A.thumb_effort_sum += (double)w * hw.effort[k];
+  if (f==(int)FingerId::Thumb) A.thumb_effort_sum += (double)w * hw.effort[k];
 }
 
 static inline void add_bigram(Agg& A, const HW& hw, u16 a, u16 b, u64 w) {
   A.big_n += w;
-  A.travel_sum += (double)w * dist2(hw.x[a],hw.y[a],hw.x[b],hw.y[b]);
+  A.travel_sum += (double)w * hw.pos[a].dist(hw.pos[b]);
 
   if (a!=b && same_finger(hw,a,b)) {
     A.sfb += w;
@@ -570,55 +531,21 @@ static inline void add_trigram(Agg& A, const HW& hw, u16 a, u16 b, u16 c, u64 w)
 static Agg accumulate(const HW& hw, const Corpus& C, const Layout& L) {
   Agg A{};
 
-  const int S = (int)C.uni.size();
-
-  // 1) internal contributions per token occurrence
-  for (int s=0; s<S; ++s) {
-    const u64 cnt = C.uni[s];
-    if (!cnt) continue;
-    const Seq& q = L.sym_seq[s];
-
-    for (int i=0; i<(int)q.n; ++i) add_press(A, hw, q.k[i], cnt);
-    for (int i=0; i+1<(int)q.n; ++i) add_bigram(A, hw, q.k[i], q.k[i+1], cnt);
-    for (int i=0; i+2<(int)q.n; ++i) add_trigram(A, hw, q.k[i], q.k[i+1], q.k[i+2], cnt);
-  }
-
-  // 2) boundary bigrams and boundary trigrams from semantic bigram counts
-  for (const auto& kv : C.bi) {
-    const u32 key = kv.first;
-    const u64 cnt = kv.second;
-    const u16 a = (u16)(key >> 16);
-    const u16 b = (u16)(key & 0xFFFFu);
-
-    const Seq& qa = L.sym_seq[a];
-    const Seq& qb = L.sym_seq[b];
-
-    add_bigram(A, hw, last_key(qa), first_key(qb), cnt);
-
-    // boundary trigram using last two of qa
-    if (qa.n >= 2) {
-      add_trigram(A, hw, qa.k[qa.n-2], qa.k[qa.n-1], first_key(qb), cnt);
+  u16 prev1 = std::numeric_limits<u16>::max();
+  u16 prev2 = std::numeric_limits<u16>::max();
+  for (u16 code : C.stream) {
+    if (code == PAUSE_CODE) {
+      prev1 = prev2 = std::numeric_limits<u16>::max();
+      continue;
     }
-    // boundary trigram using first two of qb
-    if (qb.n >= 2) {
-      add_trigram(A, hw, last_key(qa), qb.k[0], qb.k[1], cnt);
-    }
-  }
-
-  // 3) cross-token trigrams from semantic trigram counts (only when middle token expands to length 1)
-  for (const auto& kv : C.tri) {
-    const u64 key = kv.first;
-    const u64 cnt = kv.second;
-    const u16 a = (u16)(key >> 32);
-    const u16 b = (u16)((key >> 16) & 0xFFFFu);
-    const u16 c = (u16)(key & 0xFFFFu);
-
-    const Seq& qa = L.sym_seq[a];
-    const Seq& qb = L.sym_seq[b];
-    const Seq& qc = L.sym_seq[c];
-
-    if (qb.n == 1) {
-      add_trigram(A, hw, last_key(qa), qb.k[0], first_key(qc), cnt);
+    const Seq& seq = L.code_seq.at(code);
+    for (int i = 0; i < (int)seq.n; ++i) {
+      const u16 key = seq.k[i];
+      add_press(A, hw, key, 1);
+      if (prev1 != std::numeric_limits<u16>::max()) add_bigram(A, hw, prev1, key, 1);
+      if (prev2 != std::numeric_limits<u16>::max()) add_trigram(A, hw, prev2, prev1, key, 1);
+      prev2 = prev1;
+      prev1 = key;
     }
   }
 
@@ -636,52 +563,6 @@ struct Metric {
   double (*val)(const Agg&);
 };
 
-static double m_effort(const Agg& A){ return (A.press_n? A.effort_sum / (double)A.press_n : 0.0); }
-static double m_distance(const Agg& A){ return (A.press_n? A.static_dist_sum / (double)A.press_n : 0.0); }
-static double m_thumb_effort(const Agg& A){ return (A.press_n? A.thumb_effort_sum / (double)A.press_n : 0.0); }
-
-static double m_travel(const Agg& A){ return (A.big_n? A.travel_sum / (double)A.big_n : 0.0); }
-static double m_sfb(const Agg& A){ return (A.big_n? (double)A.sfb / (double)A.big_n : 0.0); }
-static double m_sfb_rake(const Agg& A){ return (A.big_n? (double)A.sfb_rake / (double)A.big_n : 0.0); }
-static double m_sfb_slide(const Agg& A){ return (A.big_n? (double)A.sfb_slide / (double)A.big_n : 0.0); }
-static double m_sfb_effective(const Agg& A){
-  // full discount; tune to partial if you want realism
-  if (!A.big_n) return 0.0;
-  double eff = (double)A.sfb - (double)A.sfb_rake - (double)A.sfb_slide;
-  return eff / (double)A.big_n;
-}
-static double m_skip_sfb(const Agg& A){ return (A.tri_n? (double)A.skip_sfb / (double)A.tri_n : 0.0); }
-
-static double m_lat_stretch(const Agg& A){ return (A.big_n? (double)A.lat_stretch / (double)A.big_n : 0.0); }
-static double m_scissors_full(const Agg& A){ return (A.big_n? (double)A.scissors_full / (double)A.big_n : 0.0); }
-static double m_scissors_half(const Agg& A){ return (A.big_n? (double)A.scissors_half / (double)A.big_n : 0.0); }
-
-static double m_alternation(const Agg& A){ return (A.big_n? (double)A.alternation / (double)A.big_n : 0.0); }
-static double m_roll_in(const Agg& A){ return (A.big_n? (double)A.roll_in / (double)A.big_n : 0.0); }
-static double m_roll_out(const Agg& A){ return (A.big_n? (double)A.roll_out / (double)A.big_n : 0.0); }
-
-static double m_redirects(const Agg& A){ return (A.tri_n? (double)A.redirects / (double)A.tri_n : 0.0); }
-static double m_weak_redirects(const Agg& A){ return (A.tri_n? (double)A.weak_redirects / (double)A.tri_n : 0.0); }
-static double m_weakish_redirects(const Agg& A){ return (A.tri_n? (double)A.weakish_redirects / (double)A.tri_n : 0.0); }
-
-static double m_trigram_alt(const Agg& A){ return (A.tri_n? (double)A.trigram_alt / (double)A.tri_n : 0.0); }
-static double m_roll3_in(const Agg& A){ return (A.tri_n? (double)A.roll3_in / (double)A.tri_n : 0.0); }
-static double m_roll3_out(const Agg& A){ return (A.tri_n? (double)A.roll3_out / (double)A.tri_n : 0.0); }
-
-static double m_home_row(const Agg& A){ return (A.press_n? (double)A.home_row_presses / (double)A.press_n : 0.0); }
-static double m_top_row(const Agg& A){ return (A.press_n? (double)A.top_row_presses / (double)A.press_n : 0.0); }
-static double m_bot_row(const Agg& A){ return (A.press_n? (double)A.bot_row_presses / (double)A.press_n : 0.0); }
-
-static double m_pinky_off_home(const Agg& A){ return (A.press_n? (double)A.pinky_off_home / (double)A.press_n : 0.0); }
-static double m_pinky_dist(const Agg& A){ return (A.press_n? A.pinky_dist_sum / (double)A.press_n : 0.0); }
-
-static double m_hand_balance(const Agg& A){
-  // absolute imbalance fraction
-  if (!A.press_n) return 0.0;
-  double L = (double)A.left_presses, R = (double)A.right_presses;
-  return std::abs(L - R) / (L + R + 1e-12);
-}
-
 // ---- stubs requested (present; implement later without changing optimizer plumbing)
 static double stub0(const Agg&){ return 0.0; }
 
@@ -689,53 +570,53 @@ static double stub0(const Agg&){ return 0.0; }
 static std::vector<Metric> default_metrics() {
   return {
     // Static load / effort / distance
-    {"effort",            2.0, LowerBetter,  m_effort},
-    {"distance",          1.0, LowerBetter,  m_distance},
-    {"thumb_effort",      0.3, LowerBetter,  m_thumb_effort},
+    {"effort",            2.0, LowerBetter,  [](const Agg& A){ return (A.press_n? A.effort_sum / (double)A.press_n : 0.0); }},
+    {"distance",          1.0, LowerBetter,  [](const Agg& A){ return (A.press_n? A.static_dist_sum / (double)A.press_n : 0.0); }},
+    {"thumb_effort",      0.3, LowerBetter,  [](const Agg& A){ return (A.press_n? A.thumb_effort_sum / (double)A.press_n : 0.0); }},
     {"finger_usage",      0.0, LowerBetter,  stub0},   // could be penalty vs targets
     {"column_usage",      0.0, LowerBetter,  stub0},
     {"col5&6",            0.0, LowerBetter,  stub0},
-    {"row_home",          0.5, HigherBetter, m_home_row},
-    {"row_top",           0.0, LowerBetter,  m_top_row},
-    {"row_bottom",        0.0, LowerBetter,  m_bot_row},
-    {"pinky_dist",        0.2, LowerBetter,  m_pinky_dist},
-    {"pinky_off_home",    0.3, LowerBetter,  m_pinky_off_home},
-    {"hand_balance",      0.2, LowerBetter,  m_hand_balance},
+    {"row_home",          0.5, HigherBetter, [](const Agg& A){ return (A.press_n? (double)A.home_row_presses / (double)A.press_n : 0.0); }},
+    {"row_top",           0.0, LowerBetter,  [](const Agg& A){ return (A.press_n? (double)A.top_row_presses / (double)A.press_n : 0.0); }},
+    {"row_bottom",        0.0, LowerBetter,  [](const Agg& A){ return (A.press_n? (double)A.bot_row_presses / (double)A.press_n : 0.0); }},
+    {"pinky_dist",        0.2, LowerBetter,  [](const Agg& A){ return (A.press_n? A.pinky_dist_sum / (double)A.press_n : 0.0); }},
+    {"pinky_off_home",    0.3, LowerBetter,  [](const Agg& A){ return (A.press_n? (double)A.pinky_off_home / (double)A.press_n : 0.0); }},
+    {"hand_balance",      0.2, LowerBetter,  [](const Agg& A){ if (!A.press_n) return 0.0; double L = (double)A.left_presses, R = (double)A.right_presses; return std::abs(L - R) / (L + R + 1e-12); }},
 
     // Bigram motion / conflicts
-    {"travel",            1.5, LowerBetter,  m_travel},
-    {"sfb",               3.0, LowerBetter,  m_sfb},
-    {"sfb_rakeable",      0.0, LowerBetter,  m_sfb_rake},
-    {"sfb_slideable",     0.0, LowerBetter,  m_sfb_slide},
-    {"sfb_effective",     2.0, LowerBetter,  m_sfb_effective},
+    {"travel",            1.5, LowerBetter,  [](const Agg& A){ return (A.big_n? A.travel_sum / (double)A.big_n : 0.0); }},
+    {"sfb",               3.0, LowerBetter,  [](const Agg& A){ return (A.big_n? (double)A.sfb / (double)A.big_n : 0.0); }},
+    {"sfb_rakeable",      0.0, LowerBetter,  [](const Agg& A){ return (A.big_n? (double)A.sfb_rake / (double)A.big_n : 0.0); }},
+    {"sfb_slideable",     0.0, LowerBetter,  [](const Agg& A){ return (A.big_n? (double)A.sfb_slide / (double)A.big_n : 0.0); }},
+    {"sfb_effective",     2.0, LowerBetter,  [](const Agg& A){ if (!A.big_n) return 0.0; double eff = (double)A.sfb - (double)A.sfb_rake - (double)A.sfb_slide; return eff / (double)A.big_n; }},
     {"sfb_2u",            0.0, LowerBetter,  stub0},   // analyzer-specific; implement if you define it
     {"skip_bigrams",      0.0, LowerBetter,  stub0},   // general skip bigrams
     {"skip_bigrams2",     0.0, LowerBetter,  stub0},   // requires 4-grams
     {"other_same_finger", 0.0, LowerBetter,  stub0},
 
-    {"lat_stretch",       0.8, LowerBetter,  m_lat_stretch},
+    {"lat_stretch",       0.8, LowerBetter,  [](const Agg& A){ return (A.big_n? (double)A.lat_stretch / (double)A.big_n : 0.0); }},
     {"lsb",               0.0, LowerBetter,  stub0},
 
     {"scissors",          0.0, LowerBetter,  stub0},
-    {"full_scissor",      0.8, LowerBetter,  m_scissors_full},
-    {"half_scissor",      0.5, LowerBetter,  m_scissors_half},
+    {"full_scissor",      0.8, LowerBetter,  [](const Agg& A){ return (A.big_n? (double)A.scissors_full / (double)A.big_n : 0.0); }},
+    {"half_scissor",      0.5, LowerBetter,  [](const Agg& A){ return (A.big_n? (double)A.scissors_half / (double)A.big_n : 0.0); }},
     {"pinky_scissors",    0.0, LowerBetter,  stub0},
     {"wide_scissors",     0.0, LowerBetter,  stub0},
 
-    {"alternation",       0.6, HigherBetter, m_alternation},
-    {"roll_in",           0.4, HigherBetter, m_roll_in},
-    {"roll_out",          0.4, LowerBetter,  m_roll_out},
+    {"alternation",       0.6, HigherBetter, [](const Agg& A){ return (A.big_n? (double)A.alternation / (double)A.big_n : 0.0); }},
+    {"roll_in",           0.4, HigherBetter, [](const Agg& A){ return (A.big_n? (double)A.roll_in / (double)A.big_n : 0.0); }},
+    {"roll_out",          0.4, LowerBetter,  [](const Agg& A){ return (A.big_n? (double)A.roll_out / (double)A.big_n : 0.0); }},
     {"rolls:alts",        0.0, HigherBetter, stub0},
     {"2-roll_in:out",     0.0, HigherBetter, stub0},
 
     // Trigram flow
-    {"skip_sfb",          0.6, LowerBetter,  m_skip_sfb},
-    {"trigram_alt",       0.3, HigherBetter, m_trigram_alt},
-    {"redir",             0.8, LowerBetter,  m_redirects},
-    {"weak_redir",        0.5, LowerBetter,  m_weak_redirects},
-    {"weakish_redir",     0.5, LowerBetter,  m_weakish_redirects},
-    {"3-roll_in",         0.0, HigherBetter, m_roll3_in},
-    {"3-roll_out",        0.0, LowerBetter,  m_roll3_out},
+    {"skip_sfb",          0.6, LowerBetter,  [](const Agg& A){ return (A.tri_n? (double)A.skip_sfb / (double)A.tri_n : 0.0); }},
+    {"trigram_alt",       0.3, HigherBetter, [](const Agg& A){ return (A.tri_n? (double)A.trigram_alt / (double)A.tri_n : 0.0); }},
+    {"redir",             0.8, LowerBetter,  [](const Agg& A){ return (A.tri_n? (double)A.redirects / (double)A.tri_n : 0.0); }},
+    {"weak_redir",        0.5, LowerBetter,  [](const Agg& A){ return (A.tri_n? (double)A.weak_redirects / (double)A.tri_n : 0.0); }},
+    {"weakish_redir",     0.5, LowerBetter,  [](const Agg& A){ return (A.tri_n? (double)A.weakish_redirects / (double)A.tri_n : 0.0); }},
+    {"3-roll_in",         0.0, HigherBetter, [](const Agg& A){ return (A.tri_n? (double)A.roll3_in / (double)A.tri_n : 0.0); }},
+    {"3-roll_out",        0.0, LowerBetter,  [](const Agg& A){ return (A.tri_n? (double)A.roll3_out / (double)A.tri_n : 0.0); }},
 
     // Shift/modifier related (your log treats Shift as its own token; these are higher-level chord metrics)
     {"shift_rate",        0.0, LowerBetter,  stub0},
@@ -760,23 +641,16 @@ static double score_layout(const std::vector<Metric>& M, const Agg& A) {
 
 // ---------------- Build initial layout (greedy by token frequency vs slot cost) ----------------
 
-static int code_named(const std::unordered_map<u16,std::string>& map, std::string_view name) {
-  for (const auto& kv : map) if (kv.second == name) return kv.first;
-  return -1;
-}
-
-static void set_fixed_symbol(Layout& L, int sym_id, const Seq& s) {
-  L.sym_slot[sym_id] = -1;
-  L.sym_seq[sym_id]  = s;
+static std::optional<u16> code_named(const Corpus& C, std::string_view name) {
+  if (auto it = C.name_to_code.find(std::string(name)); it != C.name_to_code.end()) return it->second;
+  return std::nullopt;
 }
 
 static void build_initial_layout(
-    Layout& L, const HW& hw, const Corpus& C,
-    const std::unordered_map<u16,std::string>& code_to_name)
+    Layout& L, const HW& hw, const Corpus& C)
 {
-  const int S = (int)C.uni.size();
-  L.sym_slot.assign(S, -2);     // -2 = unassigned yet
-  L.sym_seq.assign(S, Seq{});
+  L.code_slot.clear();
+  L.code_seq.clear();
   L.movable.clear();
 
   // Decide fixed tokens (hardware reality-ish). Detected by Linux names if present.
@@ -810,26 +684,23 @@ static void build_initial_layout(
   };
 
   // Mark fixed by name if present in header map.
-  std::vector<int> is_fixed(S, 0);
   for (auto nm : fixed_names) {
-    int code = code_named(code_to_name, nm);
-    if (code < 0) continue;
-    int id = (code < (int)C.code_to_id.size() ? C.code_to_id[(u16)code] : -1);
-    if (id < 0) continue;
+    const auto code = code_named(C, nm);
+    if (!code) continue;
 
     auto pk = fixed_physical(nm);
     if (!pk) continue;
 
     Seq s{}; s.n = 1; s.k[0] = (u16)(*pk);
-    set_fixed_symbol(L, id, s);
-    is_fixed[id] = 1;
+    L.code_slot[*code] = -1;
+    L.code_seq[*code] = s;
   }
 
   // Movable symbols: everything else that appears.
-  for (int s=0; s<S; ++s) {
-    if (C.uni[s]==0) continue;
-    if (is_fixed[s]) continue;
-    L.movable.push_back(s);
+  for (u16 code : C.occurring_codes) {
+    if (code == PAUSE_CODE) continue;
+    if (L.code_slot.contains(code)) continue;
+    L.movable.push_back(code);
   }
 
   // Choose number of layers to have enough slots for all movable symbols.
@@ -842,14 +713,14 @@ static void build_initial_layout(
   build_slots(L, hw, layers);
 
   if ((int)L.movable.size() > L.slots) {
-    die("not enough slots for symbols: movable=" + std::to_string(L.movable.size()) +
-        " slots=" + std::to_string(L.slots) +
-        " (add layers, allow more keys, or mark more tokens fixed)");
+    throw std::runtime_error("not enough slots for symbols: movable=" + std::to_string(L.movable.size()) +
+                             " slots=" + std::to_string(L.slots) +
+                             " (add layers, allow more keys, or mark more tokens fixed)");
   }
 
   // Sort movable symbols by descending frequency.
-  std::sort(L.movable.begin(), L.movable.end(), [&](int a, int b){
-    return C.uni[a] > C.uni[b];
+  std::sort(L.movable.begin(), L.movable.end(), [&](u16 a, u16 b){
+    return C.uni.at(a) > C.uni.at(b);
   });
 
   // Sort slots by ascending slot_cost.
@@ -860,31 +731,21 @@ static void build_initial_layout(
   });
 
   // Assign top N symbols to best slots, leave remaining slots empty.
-  L.slot_sym.assign(L.slots, -1);
+  L.slot_code.assign(L.slots, PAUSE_CODE);
 
   for (int i=0; i<(int)L.movable.size(); ++i) {
-    int sym  = L.movable[i];
+    u16 code = L.movable[i];
     int slot = slot_order[i];
-    L.sym_slot[sym] = slot;
-    L.slot_sym[slot] = sym;
-    L.sym_seq[sym] = seq_from_slot(hw, L, slot);
-  }
-
-  // For fixed symbols that we didn't set (or symbols that are fixed but not pinned), ensure sequence is set.
-  // Here: any still -2 is an error because it occurs in the corpus but has no mapping.
-  for (int s=0; s<S; ++s) {
-    if (C.uni[s]==0) continue;
-    if (L.sym_slot[s] == -2) {
-      // If it is fixed, but sequence not set, error.
-      die("unmapped symbol in corpus: id=" + std::to_string(s) + " name=" + C.id_to_name[s]);
-    }
+    L.code_slot[code] = slot;
+    L.slot_code[slot] = code;
+    L.code_seq[code] = seq_from_slot(hw, L, slot);
   }
 
   // Proposal weights for frequency-biased swaps
   L.movable_w.resize(L.movable.size());
   for (std::size_t i=0;i<L.movable.size();++i) {
-    int sym = L.movable[i];
-    L.movable_w[i] = (double)C.uni[sym] + 1.0;
+    u16 code = L.movable[i];
+    L.movable_w[i] = (double)C.uni.at(code) + 1.0;
   }
 }
 
@@ -909,27 +770,27 @@ static inline double cosine_temp(u64 it, u64 iters, int cycles, double tmax, dou
   return tmin + (cyc - tmin) * (0.25 + 0.75*decay);
 }
 
-static void swap_symbols(Layout& L, int sym_a, int sym_b, const HW& hw) {
-  int sa = L.sym_slot[sym_a];
-  int sb = L.sym_slot[sym_b];
+static void swap_symbols(Layout& L, u16 code_a, u16 code_b, const HW& hw) {
+  int sa = L.code_slot.at(code_a);
+  int sb = L.code_slot.at(code_b);
   if (sa < 0 || sb < 0) return;
 
-  std::swap(L.sym_slot[sym_a], L.sym_slot[sym_b]);
-  std::swap(L.slot_sym[sa], L.slot_sym[sb]);
+  std::swap(L.code_slot[code_a], L.code_slot[code_b]);
+  std::swap(L.slot_code[sa], L.slot_code[sb]);
 
-  L.sym_seq[sym_a] = seq_from_slot(hw, L, L.sym_slot[sym_a]);
-  L.sym_seq[sym_b] = seq_from_slot(hw, L, L.sym_slot[sym_b]);
+  L.code_seq[code_a] = seq_from_slot(hw, L, L.code_slot.at(code_a));
+  L.code_seq[code_b] = seq_from_slot(hw, L, L.code_slot.at(code_b));
 }
 
-static void move_symbol_to_empty(Layout& L, int sym, int empty_slot, const HW& hw) {
-  int sslot = L.sym_slot[sym];
+static void move_symbol_to_empty(Layout& L, u16 code, int empty_slot, const HW& hw) {
+  int sslot = L.code_slot.at(code);
   if (sslot < 0) return;
-  if (L.slot_sym[empty_slot] != -1) return;
+  if (L.slot_code[empty_slot] != PAUSE_CODE) return;
 
-  L.slot_sym[sslot] = -1;
-  L.slot_sym[empty_slot] = sym;
-  L.sym_slot[sym] = empty_slot;
-  L.sym_seq[sym] = seq_from_slot(hw, L, empty_slot);
+  L.slot_code[sslot] = PAUSE_CODE;
+  L.slot_code[empty_slot] = code;
+  L.code_slot[code] = empty_slot;
+  L.code_seq[code] = seq_from_slot(hw, L, empty_slot);
 }
 
 struct Best {
@@ -967,8 +828,8 @@ static Best anneal(const HW& hw, const Corpus& C, const std::vector<Metric>& M, 
     // Occasionally, attempt moving a high-frequency symbol into a random empty slot.
     bool try_empty = (U(rng) < 0.10);
 
-    int symA = L.movable[pick_sym(rng)];
-    int symB = symA;
+    u16 symA = L.movable[pick_sym(rng)];
+    u16 symB = symA;
 
     Layout cand = L;
 
@@ -977,11 +838,11 @@ static Best anneal(const HW& hw, const Corpus& C, const std::vector<Metric>& M, 
       swap_symbols(cand, symA, symB, hw);
     } else {
       int slot = pick_slot(rng);
-      if (cand.slot_sym[slot] == -1) {
+      if (cand.slot_code[slot] == PAUSE_CODE) {
         move_symbol_to_empty(cand, symA, slot, hw);
       } else {
-        symB = cand.slot_sym[slot];
-        if (symB >= 0) swap_symbols(cand, symA, symB, hw);
+        symB = cand.slot_code[slot];
+        swap_symbols(cand, symA, symB, hw);
       }
     }
 
@@ -1022,14 +883,13 @@ static std::string key_label(int k) {
 }
 
 static void print_layout_mapping(const HW& hw, const Corpus& C, const Layout& L) {
-  const int S = (int)C.uni.size();
   std::cout << "\n=== BEST LAYOUT MAPPING (symbol -> key sequence) ===\n";
-  for (int s=0; s<S; ++s) {
-    if (C.uni[s] == 0) continue;
-    const Seq& q = L.sym_seq[s];
+  for (const auto& [code, freq] : C.uni) {
+    const Seq& q = L.code_seq.at(code);
+    const std::string name = C.code_to_name.contains(code) ? C.code_to_name.at(code) : ("KEYCODE_" + std::to_string(code));
 
-    std::cout << "[" << s << "] " << C.id_to_name[s]
-              << " (code=" << C.id_to_code[s] << ", freq=" << C.uni[s] << ")"
+    std::cout << "[" << code << "] " << name
+              << " (freq=" << freq << ")"
               << " -> ";
 
     for (int i=0; i<(int)q.n; ++i) {
@@ -1039,7 +899,7 @@ static void print_layout_mapping(const HW& hw, const Corpus& C, const Layout& L)
       // annotate finger/hand for readability
       int h = hw.hand[k];
       int f = hw.finger[k];
-      std::cout << "(" << (h==H_L ? "L" : "R") << "," << f << ")";
+      std::cout << "(" << (h==(int)HandId::L ? "L" : "R") << "," << f << ")";
       if (i+1<(int)q.n) std::cout << " + ";
     }
     std::cout << "\n";
@@ -1054,15 +914,16 @@ static void print_slot_table(const HW& hw, const Corpus& C, const Layout& L) {
     for (int pi=0; pi<L.P; ++pi) {
       int slot = layer*L.P + pi;
       int key  = L.slot_key[slot];
-      int sym  = L.slot_sym[slot];
+      u16 code = L.slot_code[slot];
 
       std::cout << "  slot(" << layer << "," << pi << ")"
                 << " key=" << key_label(key)
                 << " -> ";
-      if (sym < 0) {
+      if (code == PAUSE_CODE) {
         std::cout << "<EMPTY>\n";
       } else {
-        std::cout << C.id_to_name[sym] << " (code=" << C.id_to_code[sym] << ")\n";
+        const std::string name = C.code_to_name.contains(code) ? C.code_to_name.at(code) : ("KEYCODE_" + std::to_string(code));
+        std::cout << name << " (code=" << code << ")\n";
       }
     }
   }
@@ -1071,14 +932,13 @@ static void print_slot_table(const HW& hw, const Corpus& C, const Layout& L) {
 // optional: write a simple machine-readable mapping file
 static void write_layout_tsv(const HW& hw, const Corpus& C, const Layout& L, const std::string& out_path) {
   std::ofstream out(out_path);
-  if (!out) die("cannot open output file " + out_path);
+  if (!out) throw std::runtime_error("cannot open output file " + out_path);
 
-  out << "sym_id\tcode\tname\tfreq\tseq_len\tk0\tk1\tk2\n";
-  const int S = (int)C.uni.size();
-  for (int s=0; s<S; ++s) {
-    if (C.uni[s]==0) continue;
-    const Seq& q = L.sym_seq[s];
-    out << s << "\t" << C.id_to_code[s] << "\t" << C.id_to_name[s] << "\t" << C.uni[s]
+  out << "code\tname\tfreq\tseq_len\tk0\tk1\tk2\n";
+  for (const auto& [code, freq] : C.uni) {
+    const Seq& q = L.code_seq.at(code);
+    const std::string name = C.code_to_name.contains(code) ? C.code_to_name.at(code) : ("KEYCODE_" + std::to_string(code));
+    out << code << "\t" << name << "\t" << freq
         << "\t" << int(q.n);
     for (int i=0;i<MAX_SEQ;++i) {
       out << "\t" << (i<int(q.n) ? int(q.k[i]) : -1);
@@ -1089,43 +949,42 @@ static void write_layout_tsv(const HW& hw, const Corpus& C, const Layout& L, con
 
 // ---------------- main ----------------
 
-static void usage(const char* a0) {
-  std::cerr << "usage: " << a0 << " log.bin [iters] [seed]\n";
-}
-
 int main(int argc, char** argv) {
-  if (argc < 2) { usage(argv[0]); return 2; }
-  std::string path = argv[1];
-  u64 iters = (argc>=3 ? std::stoull(argv[2]) : 200000ull);
-  u64 seed  = (argc>=4 ? std::stoull(argv[3]) : 1ull);
+  try {
+    if (argc < 2) {
+      std::cerr << "usage: " << argv[0] << " log.bin [iters] [seed]\n";
+      return 2;
+    }
+    std::string path = argv[1];
+    u64 iters = (argc>=3 ? std::stoull(argv[2]) : 200000ull);
+    u64 seed  = (argc>=4 ? std::stoull(argv[3]) : 1ull);
 
-  std::vector<u16> codes;
-  auto code_to_name = read_evtlog(path, codes);
-  Corpus C = build_corpus(codes, code_to_name);
+    std::vector<u16> codes;
+    auto code_to_name = read_evtlog(path, codes);
+    Corpus C = build_corpus(codes, code_to_name);
 
-  HW hw = make_voyager_like_example();
+    HW hw = make_voyager_like_example();
 
-  Layout L;
-  build_initial_layout(L, hw, C, code_to_name);
+    Layout L;
+    build_initial_layout(L, hw, C);
 
-  auto M = default_metrics();
+    auto M = default_metrics();
 
-  AnnealCfg cfg;
-  cfg.iters = iters;
-  cfg.seed  = seed;
-  cfg.cycles = 20;
-  cfg.t_max = 0.05;
-  cfg.t_min = 1e-5;
+    AnnealCfg cfg{.iters=iters, .cycles=20, .t_max=0.05, .t_min=1e-5, .seed=seed};
 
-  Best best = anneal(hw, C, M, L, cfg);
+    Best best = anneal(hw, C, M, L, cfg);
 
-  std::cout << "best_score = " << best.score << "\n";
-  std::cout << "press_n=" << best.agg.press_n << " big_n=" << best.agg.big_n << " tri_n=" << best.agg.tri_n << "\n";
-  std::cout << "metrics:\n";
-  print_metrics(M, best.agg);
-  print_layout_mapping(hw, C, best.layout);
-  print_slot_table(hw, C, best.layout);
-  write_layout_tsv(hw, C, best.layout, "best_layout.tsv");
+    std::cout << "best_score = " << best.score << "\n";
+    std::cout << "press_n=" << best.agg.press_n << " big_n=" << best.agg.big_n << " tri_n=" << best.agg.tri_n << "\n";
+    std::cout << "metrics:\n";
+    print_metrics(M, best.agg);
+    print_layout_mapping(hw, C, best.layout);
+    print_slot_table(hw, C, best.layout);
+    write_layout_tsv(hw, C, best.layout, "best_layout.tsv");
 
-  return 0;
+    return 0;
+  } catch (const std::exception& e) {
+    std::cerr << "error: " << e.what() << "\n";
+    return 1;
+  }
 }
